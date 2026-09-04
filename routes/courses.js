@@ -7,17 +7,56 @@ const ALLOWED_SORT_FIELDS = ["course_name", "credit", "created_at"];
 module.exports = function registerCourseRoutes(v1Router, v2Router) {
   v1Router.get("/courses", async (req, res, next) => {
     try {
-      const cacheKey = "courses:all";
-      // ข้อสอบข้อที่ 1 (Redis Caching): 1. ตรวจสอบใน Redis ก่อน
+      // =========================================================================
+      // ข้อสอบข้อที่ 2 : Pagination / Filtering / Sorting
+      // =========================================================================
+      // 1. Pagination: รับค่า page และ limit พร้อมคำนวณ offset
+      const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+      const limit = Math.max(1, parseInt(req.query.limit, 10) || 10);
+      const offset = (page - 1) * limit;
+      // 2. Sorting: ตรวจสอบ Allowlist ป้องกัน SQL Injection
+      const sort = req.query.sort;
+      const sortField = ALLOWED_SORT_FIELDS.includes(sort) ? sort : "id";
+      const order = (req.query.order || "ASC").toUpperCase();
+      const sortOrder = order === "DESC" ? "DESC" : "ASC";
+      // 3. Filtering: กรองเงื่อนไขแบบปลอดภัยด้วย Parameterized Query
+      const { minCredit, search } = req.query;
+      const conditions = [];
+      const params = [];
+      if (minCredit !== undefined && minCredit !== "") {
+        conditions.push("credit >= ?");
+        params.push(Number(minCredit));
+      }
+      if (search) {
+        conditions.push("course_name LIKE ?");
+        params.push(`%${search}%`);
+      }
+      const whereClause =
+        conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+      // 4. Redis Cache Key ผูกตามเงื่อนไขการค้นหา
+      const cacheKey = `courses:list:${page}:${limit}:${sortField}:${sortOrder}:${minCredit || ""}:${search || ""}`;
       const cached = await redisClient.get(cacheKey);
       if (cached) {
-        // ข้อสอบข้อที่ 1 (Redis Caching): ถ้าเจอ (Cache Hit) ตอบกลับทันที
         return res.status(200).json(JSON.parse(cached));
       }
-      // ข้อสอบข้อที่ 1 (Redis Caching): 2. ถ้าไม่เจอ (Cache Miss) ค่อยดึงจาก MySQL
-      const [rows] = await pool.query("SELECT * FROM courses ORDER BY id");
-      const responseData = { message: "สำเร็จ", data: rows };
-      // ข้อสอบข้อที่ 1 (Redis Caching): 3. เก็บลง Redis ตั้งอายุไว้ 60 วินาที
+      // 5. Query นับจำนวนทั้งหมดเพื่อคำนวณ metadata หน้า
+      const countSql = `SELECT COUNT(*) AS total FROM courses ${whereClause}`;
+      const [[{ total }]] = await pool.query(countSql, params);
+      const totalPages = Math.ceil(total / limit);
+      // 6. Query ดึงข้อมูลตามหน้าและการเรียงลำดับ
+      const dataSql = `SELECT * FROM courses ${whereClause} ORDER BY ${sortField} ${sortOrder} LIMIT ? OFFSET ?`;
+      const [rows] = await pool.query(dataSql, [...params, limit, offset]);
+      const responseData = {
+        message: "สำเร็จ",
+        data: rows,
+        pagination: {
+          page,
+          limit,
+          total,
+          totalPages,
+        },
+      };
+      // 7. เซฟลง Redis แคชไว้ 60 วินาที
       await redisClient.setEx(cacheKey, 60, JSON.stringify(responseData));
       res.status(200).json(responseData);
     } catch (err) {
@@ -42,6 +81,11 @@ module.exports = function registerCourseRoutes(v1Router, v2Router) {
             "INSERT INTO course_prerequisites (course_id, prereq_course_id) VALUES (?, ?)",
             [courseId, prereqId],
           );
+        }
+        // ล้างแคชรายการวิชาทั้งหมดที่มีการแบ่งหน้า/ค้นหาไว้
+        const keys = await redisClient.keys("courses:*");
+        if (keys.length > 0) {
+          await redisClient.del(keys);
         }
         //ข้อสอบข้อที่ 1 (Redis Caching) : 4. ลบแคชทิ้ง เพื่อให้คนที่เรียก GET ครั้งต่อไปได้ข้อมูลใหม่ล่าสุด
         await redisClient.del("courses:all");
