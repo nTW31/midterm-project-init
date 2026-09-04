@@ -63,26 +63,36 @@ module.exports = function registerCourseRoutes(v1Router, v2Router) {
       next(err);
     }
   });
-
+  // =========================================================================
+  //ข้อสอบข้อที่ 3 (Database Transaction)
+  // =========================================================================
   v1Router.post(
     "/courses",
     authMiddleware, //ข้อสอบข้อที่ 1 (JWT Auth + RBAC) : เช็ก Token ก่อน (ถ้าไม่ผ่านจะตอบ 401)
     requireRole("admin"), //ข้อสอบข้อที่ 1 (JWT Auth + RBAC) : เช็ก Role (ถ้าไม่ผ่านจะตอบ 403)
     async (req, res, next) => {
       const { course_name, credit, prerequisites = [] } = req.body;
+      // 1. ขอยืม connection 1 เส้นจาก pool เพื่อผูก transaction
+      const conn = await pool.getConnection();
       try {
-        const [result] = await pool.query(
+        // 2. เริ่มต้น Transaction (เปิดเซฟโหมด)
+        await conn.beginTransaction();
+        // 3. สั่งให้ SQL ทำงานผ่าน Connection เส้นนี้เท่านั้น
+        const [result] = await conn.query(
           "INSERT INTO courses (course_name, credit) VALUES (?, ?)",
           [course_name, credit],
         );
         const courseId = result.insertId;
+        // 4. บันทึกวิชาบังคับก่อนลงตาราง course_prerequisites (ถ้ามี)
         for (const prereqId of prerequisites) {
-          await pool.query(
+          await conn.query(
             "INSERT INTO course_prerequisites (course_id, prereq_course_id) VALUES (?, ?)",
             [courseId, prereqId],
           );
         }
-        // ล้างแคชรายการวิชาทั้งหมดที่มีการแบ่งหน้า/ค้นหาไว้
+        // 5. หากคำสั่งข้างบนผ่านฉลุยทั้งหมด ให้ Commit ยืนยันการบันทึกจริงลงฐานข้อมูล
+        await conn.commit();
+        //ข้อสอบข้อที่ 2 ล้างแคชรายการวิชาทั้งหมดที่มีการแบ่งหน้า/ค้นหาไว้
         const keys = await redisClient.keys("courses:*");
         if (keys.length > 0) {
           await redisClient.del(keys);
@@ -93,7 +103,12 @@ module.exports = function registerCourseRoutes(v1Router, v2Router) {
           .status(201)
           .json({ message: "เพิ่มข้อมูลสำเร็จ", data: { id: courseId } });
       } catch (err) {
+        // 6. หากมีคำสั่งใดคำสั่งหนึ่งล้มเหลว ให้ Rollback ยกเลิกการกระทำทั้งหมดกลับสู่จุดเริ่มต้น
+        await conn.rollback();
         next(err);
+      } finally {
+        // 7. สำคัญที่สุด! คืน connection กลับสู่ pool เสมอ ไม่ว่าจะสำเร็จหรือ error
+        conn.release();
       }
     },
   );
