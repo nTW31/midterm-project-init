@@ -112,6 +112,49 @@ module.exports = function registerCourseRoutes(v1Router, v2Router) {
       }
     },
   );
+  // =========================================================================
+  // ข้อสอบข้อที่ 4: API Versioning (Endpoint v2)
+  // =========================================================================
+  v2Router.get("/courses", async (req, res, next) => {
+    try {
+      // 1. ดึงข้อมูลวิชาทั้งหมด
+      const [courses] = await pool.query("SELECT * FROM courses ORDER BY id");
 
+      // 2. ดึงวิชาบังคับก่อน พร้อมชื่อวิชาด้วย JOIN
+      const [prereqs] = await pool.query(`
+        SELECT cp.course_id, cp.prereq_course_id, c.course_name AS prereq_name
+        FROM course_prerequisites cp
+        JOIN courses c ON cp.prereq_course_id = c.id
+      `);
+
+      // 3. ปรับโครงสร้างข้อมูล v2: รวม prerequisites เข้ามาซ้อนในแต่ละวิชา + แปลงเป็น camelCase
+      const formattedCourses = courses.map((course) => {
+        const coursePrereqs = prereqs
+          .filter((p) => p.course_id === course.id)
+          .map((p) => ({
+            id: p.prereq_course_id,
+            name: p.prereq_name,
+          }));
+
+        return {
+          id: course.id,
+          courseName: course.course_name, // ปรับชื่อเป็น camelCase
+          credit: course.credit,
+          createdAt: course.created_at,
+          prerequisites: coursePrereqs, // ฝัง array ของวิชาบังคับก่อนเข้าไปด้วย
+        };
+      });
+
+      // 4. ส่ง response โครงสร้าง v2 ที่มีทั้ง version และ data ก้อนใหม่
+      res.status(200).json({
+        version: "2.0",
+        message: "สำเร็จ",
+        total: formattedCourses.length,
+        data: formattedCourses,
+      });
+    } catch (err) {
+      next(err);
+    }
+  });
   registerCourseRoutes.ALLOWED_SORT_FIELDS = ALLOWED_SORT_FIELDS;
 };
